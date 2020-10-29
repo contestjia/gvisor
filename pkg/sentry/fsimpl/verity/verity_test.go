@@ -208,6 +208,16 @@ func (d *dentry) renameLowerMerkleAt(ctx context.Context, vfsObj *vfs.VirtualFil
 	}, &vfs.RenameOptions{})
 }
 
+// symlinkLowerAt creates a symbolic link at symlink referring to the given target
+// in the underlying filesystem.
+func (d *dentry) symlinkLowerAt(ctx context.Context, vfsObj *vfs.VirtualFilesystem, target string, symlink string) error {
+	return vfsObj.SymlinkAt(ctx, auth.CredentialsFromContext(ctx), &vfs.PathOperation{
+		Root:  d.lowerVD,
+		Start: d.lowerVD,
+		Path:  fspath.Parse(symlink),
+	}, target)
+}
+
 // newFileFD creates a new file in the verity mount, and returns the FD. The FD
 // points to a file that has random data generated.
 func newFileFD(ctx context.Context, t *testing.T, vfsObj *vfs.VirtualFilesystem, root vfs.VirtualDentry, filePath string, mode linux.FileMode) (*vfs.FileDescription, int, error) {
@@ -799,5 +809,188 @@ func TestOpenRenamedFileFails(t *testing.T) {
 				t.Errorf("got OpenAt error: %v, expected EIO", err)
 			}
 		})
+	}
+}
+
+// TestUnmodifiedSymlinkReadSucceeds ensures that readlink() for an unmodified verity enabled
+// symlink succeeds.
+func TestUnmodifiedSymlinkReadlinkSucceeds(t *testing.T) {
+	vfsObj, root, ctx, err := newVerityRoot(t, SHA256)
+	if err != nil {
+		t.Fatalf("newVerityRoot: %v", err)
+	}
+
+	target := "verity-test-file"
+	_, _, err = newFileFD(ctx, t, vfsObj, root, target, 0644)
+	if err != nil {
+		t.Fatalf("newFileFD: %v", err)
+	}
+
+	symlink := "verity-test-symlink"
+	if err := dentryFromVD(t, root).symlinkLowerAt(ctx, vfsObj, target, symlink); err != nil {
+		t.Fatalf("SymlinkAt: %v", err)
+	}
+
+	fd, err := openVerityAt(ctx, vfsObj, root, symlink, linux.O_PATH|linux.O_NOFOLLOW, linux.ModeRegular)
+
+	if err != nil {
+		t.Fatalf("OpenAt symlink: %v", err)
+	}
+
+	// Enable verity on the symlink file.
+	var args arch.SyscallArguments
+	args[1] = arch.SyscallArgument{Value: linux.FS_IOC_ENABLE_VERITY}
+	if _, err := fd.Ioctl(ctx, nil /* uio */, args); err != nil {
+		t.Fatalf("fd.Ioctl: %v", err)
+	}
+
+	// Confirms ReadlinkAt succeeds.
+	if _, err := vfsObj.ReadlinkAt(ctx, auth.CredentialsFromContext(ctx), &vfs.PathOperation{
+		Root:  root,
+		Start: root,
+		Path:  fspath.Parse(symlink),
+	}); err != nil {
+		t.Errorf("ReadlinkAt: %v", err)
+	}
+}
+
+// TestDeletedSymlinkReadFails ensures that reading value of a deleted verity enabled
+// symlink fails.
+func TestDeletedSymlinkReadFails(t *testing.T) {
+	testCases := []struct {
+		name string
+		// The original symlink is unlinked if deleteLink is true.
+		deleteLink bool
+		// The Merkle tree file is renamed if deleteMerkleFile is true.
+		deleteMerkleFile bool
+	}{
+		{
+			name:             "LinkOnly",
+			deleteLink:       true,
+			deleteMerkleFile: false,
+		},
+		{
+			name:             "MerkleOnly",
+			deleteLink:       false,
+			deleteMerkleFile: true,
+		},
+		{
+			name:             "LinkAndMerkle",
+			deleteLink:       true,
+			deleteMerkleFile: true,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			vfsObj, root, ctx, err := newVerityRoot(t, SHA256)
+			if err != nil {
+				t.Fatalf("newVerityRoot: %v", err)
+			}
+
+			target := "verity-test-file"
+			_, _, err = newFileFD(ctx, t, vfsObj, root, target, 0644)
+			if err != nil {
+				t.Fatalf("newFileFD: %v", err)
+			}
+
+			symlink := "verity-test-symlink"
+			if err := dentryFromVD(t, root).symlinkLowerAt(ctx, vfsObj, target, symlink); err != nil {
+				t.Fatalf("SymlinkAt: %v", err)
+			}
+
+			fd, err := openVerityAt(ctx, vfsObj, root, symlink, linux.O_PATH|linux.O_NOFOLLOW, linux.ModeRegular)
+
+			if err != nil {
+				t.Fatalf("OpenAt symlink: %v", err)
+			}
+
+			// Enable verity on the symlink file.
+			var args arch.SyscallArguments
+			args[1] = arch.SyscallArgument{Value: linux.FS_IOC_ENABLE_VERITY}
+			if _, err := fd.Ioctl(ctx, nil /* uio */, args); err != nil {
+				t.Fatalf("fd.Ioctl: %v", err)
+			}
+
+			if tc.deleteLink {
+				if err := dentryFromVD(t, root).unlinkLowerAt(ctx, vfsObj, symlink); err != nil {
+					t.Fatalf("UnlinkAt: %v", err)
+				}
+			}
+			if tc.deleteMerkleFile {
+				if err := dentryFromVD(t, root).unlinkLowerMerkleAt(ctx, vfsObj, symlink); err != nil {
+					t.Fatalf("UnlinkAt: %v", err)
+				}
+			}
+			// Verify ReadlinkAt() fails.
+			if _, err := vfsObj.ReadlinkAt(ctx, auth.CredentialsFromContext(ctx), &vfs.PathOperation{
+				Root:  root,
+				Start: root,
+				Path:  fspath.Parse(symlink),
+			}); err != syserror.EIO {
+				t.Fatalf("ReadlinkAt succeeded with modified symlink: %v", err)
+			}
+		})
+	}
+
+}
+
+// TestModifiedSymlinkReadFails ensures that reading value of a modified verity enabled
+// symlink fails.
+func TestModifiedSymlinkReadFails(t *testing.T) {
+	vfsObj, root, ctx, err := newVerityRoot(t, SHA256)
+	if err != nil {
+		t.Fatalf("newVerityRoot: %v", err)
+	}
+
+	// Create target file.
+	target := "verity-test-file"
+	_, _, err = newFileFD(ctx, t, vfsObj, root, target, 0644)
+	if err != nil {
+		t.Fatalf("newFileFD: %v", err)
+	}
+
+	// Create symlink which points to target file.
+	symlink := "verity-test-symlink"
+	if err := dentryFromVD(t, root).symlinkLowerAt(ctx, vfsObj, target, symlink); err != nil {
+		t.Fatalf("SymlinkAt: %v", err)
+	}
+
+	// Open symlink file to get the fd for ioctl in new step.
+	fd, err := openVerityAt(ctx, vfsObj, root, symlink, linux.O_PATH|linux.O_NOFOLLOW, linux.ModeRegular)
+	if err != nil {
+		t.Fatalf("OpenAt symlink: %v", err)
+	}
+
+	// Enable verity on the symlink file.
+	var args arch.SyscallArguments
+	args[1] = arch.SyscallArgument{Value: linux.FS_IOC_ENABLE_VERITY}
+	if _, err := fd.Ioctl(ctx, nil /* uio */, args); err != nil {
+		t.Fatalf("fd.Ioctl: %v", err)
+	}
+
+	// Create a new target file.
+	newTarget := "verity-test-file-new"
+	_, _, err = newFileFD(ctx, t, vfsObj, root, newTarget, 0644)
+	if err != nil {
+		t.Fatalf("newFileFD: %v", err)
+	}
+
+	// Unlink symlink->target.
+	if err := dentryFromVD(t, root).unlinkLowerAt(ctx, vfsObj, symlink); err != nil {
+		t.Fatalf("UnlinkAt: %v", err)
+	}
+
+	// Link symlink->newTarget.
+	if err := dentryFromVD(t, root).symlinkLowerAt(ctx, vfsObj, newTarget, symlink); err != nil {
+		t.Fatalf("SymlinkAt: %v", err)
+	}
+
+	// Verify ReadlinkAt() fails.
+	if _, err := vfsObj.ReadlinkAt(ctx, auth.CredentialsFromContext(ctx), &vfs.PathOperation{
+		Root:  root,
+		Start: root,
+		Path:  fspath.Parse(symlink),
+	}); err != syserror.EIO {
+		t.Fatalf("ReadlinkAt succeeded with modified symlink: %v", err)
 	}
 }
