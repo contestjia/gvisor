@@ -86,7 +86,7 @@ class SetgidDirTest : public ::testing::Test {
     original_gid_ = getegid();
 
     // TODO(b/175325250): Enable when setgid directories are supported.
-    SKIP_IF(IsRunningOnGvisor());
+    SKIP_IF(IsRunningWithVFS1());
     SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETGID)));
 
     temp_dir_ = ASSERT_NO_ERRNO_AND_VALUE(
@@ -305,9 +305,7 @@ struct FileModeTestcase {
 class FileModeTest : public ::testing::TestWithParam<FileModeTestcase> {};
 
 TEST_P(FileModeTest, WriteToFile) {
-  // TODO(b/175325250): Enable when setgid directories are supported.
-  SKIP_IF(IsRunningOnGvisor());
-
+  SKIP_IF(IsRunningWithVFS1());
   auto temp_dir = ASSERT_NO_ERRNO_AND_VALUE(
       TempPath::CreateDirWith(GetAbsoluteTestTmpdir(), 0777 /* mode */));
   auto path = JoinPath(temp_dir.path(), GetParam().name);
@@ -330,9 +328,7 @@ TEST_P(FileModeTest, WriteToFile) {
 }
 
 TEST_P(FileModeTest, TruncateFile) {
-  // TODO(b/175325250): Enable when setgid directories are supported.
-  SKIP_IF(IsRunningOnGvisor());
-
+  SKIP_IF(IsRunningWithVFS1());
   auto temp_dir = ASSERT_NO_ERRNO_AND_VALUE(
       TempPath::CreateDirWith(GetAbsoluteTestTmpdir(), 0777 /* mode */));
   auto path = JoinPath(temp_dir.path(), GetParam().name);
