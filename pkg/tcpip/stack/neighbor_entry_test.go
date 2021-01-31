@@ -239,19 +239,18 @@ func entryTestSetup(c NUDConfigurations) (*neighborEntry, *testNUDDispatcher, *e
 	nudState := NewNUDState(c, rng)
 	var linkRes entryTestLinkResolver
 	// Stub out the neighbor cache to verify deletion from the cache.
-	neigh := &neighborCache{
-		nic:     &nic,
-		state:   nudState,
-		linkRes: &linkRes,
-		cache:   make(map[tcpip.Address]*neighborEntry, neighborCacheSize),
+	l := &linkResolver{
+		resolver: &linkRes,
+		neigh: neighborCache{
+			nic:     &nic,
+			state:   nudState,
+			linkRes: &linkRes,
+			cache:   make(map[tcpip.Address]*neighborEntry, neighborCacheSize),
+		},
 	}
-	l := linkResolver{
-		resolver:      &linkRes,
-		neighborTable: neigh,
-	}
-	entry := newNeighborEntry(neigh, entryTestAddr1 /* remoteAddr */, nudState)
-	neigh.cache[entryTestAddr1] = entry
-	nic.linkAddrResolvers = map[tcpip.NetworkProtocolNumber]linkResolver{
+	entry := newNeighborEntry(&l.neigh, entryTestAddr1 /* remoteAddr */, nudState)
+	l.neigh.cache[entryTestAddr1] = entry
+	nic.linkAddrResolvers = map[tcpip.NetworkProtocolNumber]*linkResolver{
 		header.IPv6ProtocolNumber: l,
 	}
 

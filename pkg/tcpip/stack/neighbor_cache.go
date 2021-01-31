@@ -260,30 +260,6 @@ func (n *neighborCache) setConfig(config NUDConfigurations) {
 	n.state.SetConfig(config)
 }
 
-var _ neighborTable = (*neighborCache)(nil)
-
-func (n *neighborCache) neighbors() ([]NeighborEntry, tcpip.Error) {
-	return n.entries(), nil
-}
-
-func (n *neighborCache) get(addr, localAddr tcpip.Address, onResolve func(LinkResolutionResult)) (tcpip.LinkAddress, <-chan struct{}, tcpip.Error) {
-	entry, ch, err := n.entry(addr, localAddr, onResolve)
-	return entry.LinkAddr, ch, err
-}
-
-func (n *neighborCache) remove(addr tcpip.Address) tcpip.Error {
-	if !n.removeEntry(addr) {
-		return &tcpip.ErrBadAddress{}
-	}
-
-	return nil
-}
-
-func (n *neighborCache) removeAll() tcpip.Error {
-	n.clear()
-	return nil
-}
-
 // handleProbe handles a neighbor probe as defined by RFC 4861 section 7.2.3.
 //
 // Validation of the probe is expected to be handled by the caller.
@@ -323,13 +299,4 @@ func (n *neighborCache) handleUpperLevelConfirmation(addr tcpip.Address) {
 		entry.handleUpperLevelConfirmationLocked()
 		entry.mu.Unlock()
 	}
-}
-
-func (n *neighborCache) nudConfig() (NUDConfigurations, tcpip.Error) {
-	return n.config(), nil
-}
-
-func (n *neighborCache) setNUDConfig(c NUDConfigurations) tcpip.Error {
-	n.setConfig(c)
-	return nil
 }
