@@ -201,7 +201,8 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer) {
 		} else {
 			op = &optionUsageReceive{}
 		}
-		tmp, optProblem := e.processIPOptions(pkt, opts, op)
+		var optProblem *header.IPv4OptParameterProblem
+		newOptions, optProblem = e.processIPOptions(pkt, opts, op)
 		if optProblem != nil {
 			if optProblem.NeedICMP {
 				_ = e.protocol.returnError(&icmpReasonParamProblem{
@@ -212,7 +213,10 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer) {
 			}
 			return
 		}
-		newOptions = tmp
+		_ = copy(opts, newOptions)
+		for i := len(newOptions); i < len(opts); i++ {
+			opts[i] = 0 //(EOL) RFC 791 page 23 "The padding is zero".
+		}
 	}
 
 	// TODO(b/112892170): Meaningfully handle all ICMP types.
@@ -363,19 +367,26 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer) {
 // icmpReason is a marker interface for IPv4 specific ICMP errors.
 type icmpReason interface {
 	isICMPReason()
+	isForwarding() bool
 }
 
 // icmpReasonPortUnreachable is an error where the transport protocol has no
 // listener and no alternative means to inform the sender.
-type icmpReasonPortUnreachable struct{}
+type icmpReasonPortUnreachable struct{ Forwarding bool }
 
 func (*icmpReasonPortUnreachable) isICMPReason() {}
+func (r *icmpReasonPortUnreachable) isForwarding() bool {
+	return r.Forwarding
+}
 
 // icmpReasonProtoUnreachable is an error where the transport protocol is
 // not supported.
-type icmpReasonProtoUnreachable struct{}
+type icmpReasonProtoUnreachable struct{ Forwarding bool }
 
 func (*icmpReasonProtoUnreachable) isICMPReason() {}
+func (r *icmpReasonProtoUnreachable) isForwarding() bool {
+	return r.Forwarding
+}
 
 // icmpReasonTTLExceeded is an error where a packet's time to live exceeded in
 // transit to its final destination, as per RFC 792 page 6, Time Exceeded
@@ -383,21 +394,31 @@ func (*icmpReasonProtoUnreachable) isICMPReason() {}
 type icmpReasonTTLExceeded struct{}
 
 func (*icmpReasonTTLExceeded) isICMPReason() {}
+func (*icmpReasonTTLExceeded) isForwarding() bool {
+	return true
+}
 
 // icmpReasonReassemblyTimeout is an error where insufficient fragments are
 // received to complete reassembly of a packet within a configured time after
 // the reception of the first-arriving fragment of that packet.
-type icmpReasonReassemblyTimeout struct{}
+type icmpReasonReassemblyTimeout struct{ Forwarding bool }
 
 func (*icmpReasonReassemblyTimeout) isICMPReason() {}
+func (r *icmpReasonReassemblyTimeout) isForwarding() bool {
+	return r.Forwarding
+}
 
 // icmpReasonParamProblem is an error to use to request a Parameter Problem
 // message to be sent.
 type icmpReasonParamProblem struct {
-	pointer byte
+	pointer    byte
+	Forwarding bool
 }
 
 func (*icmpReasonParamProblem) isICMPReason() {}
+func (r *icmpReasonParamProblem) isForwarding() bool {
+	return r.Forwarding
+}
 
 // returnError takes an error descriptor and generates the appropriate ICMP
 // error packet for IPv4 and sends it back to the remote device that sent
@@ -436,26 +457,14 @@ func (p *protocol) returnError(reason icmpReason, pkt *stack.PacketBuffer) tcpip
 		return nil
 	}
 
-	// If we hit a TTL Exceeded error, then we know we are operating as a router.
-	// As per RFC 792 page 6, Time Exceeded Message,
-	//
-	//   If the gateway processing a datagram finds the time to live field
-	//   is zero it must discard the datagram.  The gateway may also notify
-	//   the source host via the time exceeded message.
-	//
-	//   ...
-	//
-	//   Code 0 may be received from a gateway. ...
-	//
-	// Note, Code 0 is the TTL exceeded error.
-	//
 	// If we are operating as a router/gateway, don't use the packet's destination
 	// address as the response's source address as we should not not own the
 	// destination address of a packet we are forwarding.
 	localAddr := origIPHdrDst
-	if _, ok := reason.(*icmpReasonTTLExceeded); ok {
+	if reason.isForwarding() {
 		localAddr = ""
 	}
+
 	// Even if we were able to receive a packet from some remote, we may not have
 	// a route to it - the remote may be blocked via routing rules. We must always
 	// consult our routing table and find a route to the remote before sending any

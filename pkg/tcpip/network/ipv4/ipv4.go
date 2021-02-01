@@ -570,6 +570,28 @@ func (e *endpoint) forwardPacket(pkt *stack.PacketBuffer) tcpip.Error {
 		return e.protocol.returnError(&icmpReasonTTLExceeded{}, pkt)
 	}
 
+	if opts := h.Options(); len(opts) != 0 {
+		var newopts header.IPv4Options
+		var optProblem *header.IPv4OptParameterProblem
+		if newopts, optProblem = e.processIPOptions(pkt, opts, &optionUsageForward{}); optProblem != nil {
+			if optProblem.NeedICMP {
+				_ = e.protocol.returnError(&icmpReasonParamProblem{
+					pointer:    optProblem.Pointer,
+					Forwarding: true,
+				}, pkt)
+				e.protocol.stack.Stats().MalformedRcvdPackets.Increment()
+				e.stats.ip.MalformedPacketsReceived.Increment()
+			}
+			return nil // option problems are not reported locally.
+		}
+		_ = copy(opts, newopts)
+		// While not strictly required, common practice is to not shrink the
+		// options even if they could be, so pad to original length with 0.
+		for i := len(newopts); i < len(opts); i++ {
+			opts[i] = 0 //(EOL) RFC 791 page 23 "The padding is zero".
+		}
+	}
+
 	dstAddr := h.DestinationAddress()
 
 	// Check if the destination is owned by the stack.
@@ -691,8 +713,9 @@ func (e *endpoint) handlePacket(pkt *stack.PacketBuffer) {
 		}
 	}
 
-	// The destination address should be an address we own or a group we joined
-	// for us to receive the packet. Otherwise, attempt to forward the packet.
+	// Before we do any processing, note if the packet was received as some
+	// sort of broadcast. The destination address should be an address we own
+	// or a group we joined
 	if addressEndpoint := e.AcquireAssignedAddress(dstAddr, e.nic.Promiscuous(), stack.CanBePrimaryEndpoint); addressEndpoint != nil {
 		subnet := addressEndpoint.AddressWithPrefix().Subnet()
 		addressEndpoint.DecRef()
@@ -702,7 +725,6 @@ func (e *endpoint) handlePacket(pkt *stack.PacketBuffer) {
 			stats.ip.InvalidDestinationAddressesReceived.Increment()
 			return
 		}
-
 		_ = e.forwardPacket(pkt)
 		return
 	}
@@ -723,6 +745,22 @@ func (e *endpoint) handlePacket(pkt *stack.PacketBuffer) {
 			stats.ip.MalformedPacketsReceived.Increment()
 			stats.ip.MalformedFragmentsReceived.Increment()
 			return
+		}
+		if opts := h.Options(); len(opts) != 0 {
+			// If there are options we need to check them before we do assembly
+			// or we could be assembling errant packets. However we do not change the
+			// options as that could lead to double processing later.
+			_, optProblem := e.processIPOptions(pkt, opts, &optionUsageVerify{})
+			if optProblem != nil {
+				if optProblem.NeedICMP {
+					_ = e.protocol.returnError(&icmpReasonParamProblem{
+						pointer: optProblem.Pointer,
+					}, pkt)
+					e.protocol.stack.Stats().MalformedRcvdPackets.Increment()
+					e.stats.ip.MalformedPacketsReceived.Increment()
+				}
+				return
+			}
 		}
 		// The packet is a fragment, let's try to reassemble it.
 		start := h.FragmentOffset()
@@ -782,17 +820,11 @@ func (e *endpoint) handlePacket(pkt *stack.PacketBuffer) {
 		e.handleICMP(pkt)
 		return
 	}
-	if p == header.IGMPProtocolNumber {
-		e.mu.Lock()
-		e.mu.igmp.handleIGMP(pkt)
-		e.mu.Unlock()
-		return
-	}
+	// ICMP handles options itself but do it here for all remaining destinations.
 	if opts := h.Options(); len(opts) != 0 {
-		// TODO(gvisor.dev/issue/4586):
-		// When we add forwarding support we should use the verified options
-		// rather than just throwing them away.
-		if _, optProblem := e.processIPOptions(pkt, opts, &optionUsageReceive{}); optProblem != nil {
+		var newopts header.IPv4Options
+		var optProblem *header.IPv4OptParameterProblem
+		if newopts, optProblem = e.processIPOptions(pkt, opts, &optionUsageReceive{}); optProblem != nil {
 			if optProblem.NeedICMP {
 				_ = e.protocol.returnError(&icmpReasonParamProblem{
 					pointer: optProblem.Pointer,
@@ -802,6 +834,16 @@ func (e *endpoint) handlePacket(pkt *stack.PacketBuffer) {
 			}
 			return
 		}
+		_ = copy(opts, newopts)
+		for i := len(newopts); i < len(opts); i++ {
+			opts[i] = 0 //(EOL) RFC 791 page 23 "The padding is zero".
+		}
+	}
+	if p == header.IGMPProtocolNumber {
+		e.mu.Lock()
+		e.mu.igmp.handleIGMP(pkt)
+		e.mu.Unlock()
+		return
 	}
 
 	switch res := e.dispatcher.DeliverTransportPacket(p, pkt); res {
@@ -1211,23 +1253,49 @@ type optionsUsage interface {
 	actions() optionActions
 }
 
-// optionUsageReceive implements optionsUsage for received packets.
+// optionUsageVerify implements optionsUsage for when we just want to check
+// fragments. Don't change anything, just check and reject if bad.
+// Don't bother copying unknown options as the caller shouldn't need them.
+type optionUsageVerify struct{}
+
+// actions implements optionsUsage.
+func (*optionUsageVerify) actions() optionActions {
+	return optionActions{
+		timestamp:   optionVerify,
+		recordRoute: optionVerify,
+		unknown:     optionRemove,
+	}
+}
+
+// optionUsageReceive implements optionsUsage for packets we will pass
+// to the transport layer (with the exception of Echo requests).
 type optionUsageReceive struct{}
 
 // actions implements optionsUsage.
 func (*optionUsageReceive) actions() optionActions {
 	return optionActions{
-		timestamp:   optionVerify,
-		recordRoute: optionVerify,
+		timestamp:   optionProcess,
+		recordRoute: optionProcess,
 		unknown:     optionPass,
 	}
 }
 
-// TODO(gvisor.dev/issue/4586): Add an entry here for forwarding when it
-// is enabled (Process, Process, Pass) and for fragmenting (Process, Process,
-// Pass for frag1, but Remove,Remove,Remove for all other frags).
+// optionUsageForward implements optionsUsage for packets about to be forwarded.
+// All options are passed on regardless of whether we recognise them, however
+// we do process the options used by ping -R and ping -T.
+type optionUsageForward struct{}
+
+// actions implements optionsUsage.
+func (*optionUsageForward) actions() optionActions {
+	return optionActions{
+		timestamp:   optionProcess,
+		recordRoute: optionProcess,
+		unknown:     optionPass,
+	}
+}
 
 // optionUsageEcho implements optionsUsage for echo packet processing.
+// Only Timestamp and RecordRoute are processed and sent back.
 type optionUsageEcho struct{}
 
 // actions implements optionsUsage.
