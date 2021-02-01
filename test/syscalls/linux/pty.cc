@@ -459,6 +459,46 @@ TEST(BasicPtyTest, OpenMasterReplica) {
   FileDescriptor replica = ASSERT_NO_ERRNO_AND_VALUE(OpenReplica(master));
 }
 
+TEST(BasicPtyTest, OpenSetsControllingTTY) {
+  SKIP_IF(IsRunningWithVFS1());
+  // setsid either puts us in a new session or fails because we're already the
+  // session leader. Either way, this ensures we're the session leader.
+  setsid();
+  FileDescriptor master = ASSERT_NO_ERRNO_AND_VALUE(Open("/dev/ptmx", O_RDWR));
+  FileDescriptor replica =
+      ASSERT_NO_ERRNO_AND_VALUE(OpenReplica(master, O_NONBLOCK | O_RDWR));
+
+  // Opening replica should make it our controlling TTY, and therefore we are
+  // able to give it up.
+  ASSERT_THAT(ioctl(replica.get(), TIOCNOTTY), SyscallSucceeds());
+}
+
+TEST(BasicPtyTest, OpenMasterDoesNotSetsControllingTTY) {
+  SKIP_IF(IsRunningWithVFS1());
+  // setsid either puts us in a new session or fails because we're already the
+  // session leader. Either way, this ensures we're the session leader.
+  setsid();
+  FileDescriptor master = ASSERT_NO_ERRNO_AND_VALUE(Open("/dev/ptmx", O_RDWR));
+
+  // Opening master does not set the controlling TTY, and therefore we are
+  // unable to give it up.
+  ASSERT_THAT(ioctl(master.get(), TIOCNOTTY), SyscallFailsWithErrno(ENOTTY));
+}
+
+TEST(BasicPtyTest, OpenNOCTTY) {
+  SKIP_IF(IsRunningWithVFS1());
+  // setsid either puts us in a new session or fails because we're already the
+  // session leader. Either way, this ensures we're the session leader.
+  setsid();
+  FileDescriptor master = ASSERT_NO_ERRNO_AND_VALUE(Open("/dev/ptmx", O_RDWR));
+  FileDescriptor replica = ASSERT_NO_ERRNO_AND_VALUE(
+      OpenReplica(master, O_NOCTTY | O_NONBLOCK | O_RDWR));
+
+  // Opening replica with O_NOCTTY won't make it our controlling TTY, and
+  // therefore we are unable to give it up.
+  ASSERT_THAT(ioctl(replica.get(), TIOCNOTTY), SyscallFailsWithErrno(ENOTTY));
+}
+
 // The replica entry in /dev/pts/ disappears when the master is closed, even if
 // the replica is still open.
 TEST(BasicPtyTest, ReplicaEntryGoneAfterMasterClose) {
