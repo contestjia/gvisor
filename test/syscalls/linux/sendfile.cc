@@ -551,6 +551,28 @@ TEST(SendFileTest, SendPipeEOF) {
               SyscallSucceedsWithValue(0));
 }
 
+TEST(SendFileTest, SendToFullPipe) {
+  // Create and open an empty input file.
+  const TempPath in_file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  const FileDescriptor inf =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(in_file.path(), O_RDWR));
+
+  // Setup the output named pipe.
+  int fds[2];
+  ASSERT_THAT(pipe2(fds, O_NONBLOCK), SyscallSucceeds());
+  const FileDescriptor rfd(fds[0]);
+  const FileDescriptor wfd(fds[1]);
+
+  int pipe_size = -1;
+  ASSERT_THAT(pipe_size = fcntl(wfd.get(), F_GETPIPE_SZ), SyscallSucceeds());
+  int dataSize = pipe_size * 8;
+  ASSERT_THAT(ftruncate(inf.get(), dataSize), SyscallSucceeds());
+
+  ASSERT_THAT(sendfile(wfd.get(), inf.get(), 0, dataSize), SyscallSucceeds());
+  EXPECT_THAT(sendfile(wfd.get(), inf.get(), 0, dataSize),
+              SyscallFailsWithErrno(EAGAIN));
+}
+
 TEST(SendFileTest, SendPipeBlocks) {
   // Create temp file.
   constexpr char kData[] =
